@@ -99,40 +99,83 @@ Behavior examples:
 
 ## CLI and flags
 
-The proxy has two main flags that control configuration loading and live reloads:
+The proxy can be configured via flags or environment variables. There are two related controls:
 
-- `--config <path>`: path to a YAML config file. This flag is optional when not using `--watch`.
-- `--watch`: enable watching the config file and live-reloading on changes. When `--watch` is used, `--config` is
-  required.
+- `--config <path>`: path to a YAML config file. If omitted, the program will consult the environment variable
+  `CALLBACK_GUARD_CONFIG` for a default path.
+- `--watch`: enable watching the config file and live-reloading on changes. If omitted, the program will consult the
+  environment variable `CALLBACK_GUARD_WATCH` (parsed as a boolean).
 
-Behavior summary:
+Behavior summary (new):
 
-- If `--config` is omitted and `--watch` is not set, the proxy runs with a small in-memory default config:
-    - `listen: ":8080"`
-    - no auth configured
-    - empty whitelist and blacklist lists
+- `CALLBACK_GUARD_CONFIG` supplies the default value for `--config` when the flag is not provided.
+- `CALLBACK_GUARD_WATCH` supplies the default for `--watch` when the flag is not provided. Standard boolean values are
+  supported (`true`, `false`, `1`, `0`, etc.).
 
-  This mode is convenient for quick local testing, but production use should provide a config file.
+Exactly how missing/invalid config values are handled:
 
-- If `--config` is provided, the proxy loads that YAML and applies its rules (and `--watch` can be used to reload it).
-- If `--watch` is set but `--config` is not provided, the program will exit with an error — live reload requires a file
-  to watch.
+- If both the flag and `CALLBACK_GUARD_CONFIG` are empty and `--watch` is false (or unset), the proxy will start with a
+  small in-memory default config and log a warning. The in-memory default is equivalent to:
 
-Examples:
+```yaml
+listen: ":8080"
+# no auth configured
+# empty whitelist and blacklist lists
+```
 
-- Run with default in-memory config (no file):
+  The program emits the following warning in this case:
+
+  `warning: no config provided (CALLBACK_GUARD_CONFIG empty); using default in-memory config`
+
+- If a config path is provided (via `--config` or `CALLBACK_GUARD_CONFIG`) but the file does not exist:
+  - If `--watch` is true (or `CALLBACK_GUARD_WATCH` is truthy), the program will exit with an error. The fatal message
+    will be one of:
+
+    `config file <path> does not exist; -watch requires an existing config file`
+
+    or (if you passed `-watch` without a config path):
+
+    `-watch requires --config to be set (or set CALLBACK_GUARD_CONFIG)`
+
+  - If `--watch` is false, the program logs a warning and falls back to the in-memory default config. The warning is:
+
+    `warning: config file <path> does not exist; using default in-memory config`
+
+- If a config path is provided and the file exists but contains invalid YAML or invalid CIDR/IP entries, the program
+  fails fast (prints an error and exits). This is the current behaviour to avoid running with a silently malformed
+  configuration.
+
+Examples
+
+- Use environment variables to supply defaults (PowerShell):
+
+```powershell
+$env:CALLBACK_GUARD_CONFIG = 'C:\path\to\config.yaml'
+$env:CALLBACK_GUARD_WATCH = 'true'  # or 'false'
+.\callback-guard.exe
+```
+
+- Use environment variables to supply defaults (bash):
+
+```bash
+export CALLBACK_GUARD_CONFIG=/path/to/config.yaml
+export CALLBACK_GUARD_WATCH=true
+./callback-guard
+```
+
+- Run with no config file (uses in-memory defaults, prints a warning):
 
 ```powershell
 .\callback-guard.exe
 ```
 
-- Run with a config file (no watching):
+- Run with an explicit config file (no watching):
 
 ```powershell
 .\callback-guard.exe -config .\config.yaml
 ```
 
-- Run with a config file and live reload:
+- Run with an explicit config file and live reload (config file must exist):
 
 ```powershell
 .\callback-guard.exe -config .\config.yaml -watch

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -881,25 +882,46 @@ func main() {
 		return
 	}
 
-	// Make --config optional. When -watch is set, --config is required.
-	configPath := flag.String("config", "", "path to config file (required when -watch)")
-	watch := flag.Bool("watch", false, "watch config and auto-reload")
+	// Read defaults from environment variables
+	envConfig := os.Getenv("CALLBACK_GUARD_CONFIG")
+	watchDefault := false
+	if v := os.Getenv("CALLBACK_GUARD_WATCH"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			watchDefault = b
+		}
+	}
+
+	configPath := flag.String("config", envConfig, "path to config file (required when -watch)")
+	watch := flag.Bool("watch", watchDefault, "watch config and auto-reload")
 	flag.Parse()
 
 	var cfg *Config
 	if *configPath == "" {
 		if *watch {
-			log.Fatalf("-watch requires --config to be set")
+			log.Fatalf("-watch requires --config to be set (or set CALLBACK_GUARD_CONFIG)")
 		}
-		// No config provided and not watching: use sane defaults in-memory.
-		cfg = &Config{
-			Listen: ":8080",
-		}
+		// No config provided and not watching: use sane defaults in-memory and warn.
+		log.Printf("warning: no config provided (CALLBACK_GUARD_CONFIG empty); using default in-memory config")
+		cfg = &Config{Listen: ":8080"}
 	} else {
-		var err error
-		cfg, err = loadConfig(*configPath)
-		if err != nil {
-			log.Fatalf("failed to load config %s: %v", *configPath, err)
+		// config path provided (via flag or env) — check existence
+		if _, err := os.Stat(*configPath); err != nil {
+			if os.IsNotExist(err) {
+				if *watch {
+					log.Fatalf("config file %s does not exist; -watch requires an existing config file", *configPath)
+				}
+				// not watching: warn and fall back to in-memory default
+				log.Printf("warning: config file %s does not exist; using default in-memory config", *configPath)
+				cfg = &Config{Listen: ":8080"}
+			} else {
+				log.Fatalf("failed to stat config %s: %v", *configPath, err)
+			}
+		} else {
+			var err error
+			cfg, err = loadConfig(*configPath)
+			if err != nil {
+				log.Fatalf("failed to load config %s: %v", *configPath, err)
+			}
 		}
 	}
 

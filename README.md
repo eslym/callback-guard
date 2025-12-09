@@ -25,7 +25,71 @@ code.
 - Optional basic proxy authentication to restrict who can use the proxy.
 - Lightweight, configurable, and can watch and reload configuration at runtime (when enabled).
 
-### Blacklist (denylist)
+### Per-user overrides
+
+Callback Guard supports per-user override rules keyed by username. Overrides allow you to define whitelist and blacklist
+entries that apply specifically to requests authenticated as a given user. This is useful when different clients or
+internal services need distinct outbound rules.
+
+Where to configure:
+- Add an `overrides` mapping in your YAML config. Each key is a username (matching the username clients present via
+  Proxy Basic auth). The value is an object with `whitelist` and `blacklist` sections using the same `ip` and `host`
+  shapes as the global config.
+
+Precedence rules (applied in this exact order):
+1. User-scoped host blacklist (deny)
+2. User-scoped IP blacklist (deny)
+3. User-scoped host whitelist (allow)
+4. User-scoped IP whitelist (allow)
+5. Global host blacklist (deny)
+6. Global IP blacklist (deny)
+7. Global host whitelist (allow)
+8. Global IP whitelist (allow)
+
+Notes on semantics:
+- Blacklists are conservative: if any resolved IP for a hostname appears in a blacklist (user or global), the request is denied.
+- Host patterns without an explicit port only match when the destination port is 80 or 443 (same as global host rules).
+- Per-user overrides are considered only when the request is authenticated and the username matches an entry in `overrides`.
+  If the proxy is running without auth enabled, `overrides` has no effect.
+
+Example per-user overrides (config.yaml):
+
+```yaml
+listen: ":8080"
+handle_redirect: true
+auth:
+  alice: "$2a$10$..."   # bcrypt hash for user "alice"
+  bob:   "$2a$10$..."
+
+whitelist:
+  ip: [ "203.0.113.0/24" ]
+  host: [ "public.example.com" ]
+blacklist:
+  ip: [ "10.0.0.0/8", "192.168.0.0/16" ]
+  host: [ "*.malicious.local" ]
+
+overrides:
+  alice:
+    whitelist:
+      host: [ "internal.example.com" ]
+      ip: [ "10.5.7.8" ]
+    blacklist:
+      host: [ "danger.internal.local" ]
+  bob:
+    whitelist:
+      host: [ "staging.example.local:8080" ]
+    blacklist:
+      ip: [ "10.0.0.0/8" ]
+```
+
+Behavior examples:
+- A request authenticated as `alice` to `internal.example.com:80` will be allowed by the user host whitelist even if the
+  global policy would block its resolved IPs.
+- A request authenticated as `bob` to `10.1.2.3` will be denied because `bob`'s user IP blacklist contains `10.0.0.0/8`.
+- A request authenticated as `alice` to `danger.internal.local` will be denied due to `alice`'s user host blacklist (user-level
+  blacklist takes precedence over user whitelist and global lists).
+
+## Blacklist (denylist)
 
 The blacklist provides a way to explicitly deny destinations even if they would otherwise be permitted by the whitelist.
 It accepts the same configuration shapes and host-pattern semantics as the whitelist:

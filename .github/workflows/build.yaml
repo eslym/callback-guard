@@ -8,7 +8,6 @@ on:
 env:
   IMAGE: eslym/callback-guard
   CACHE: eslym/callback-guard:buildcache
-  GO_VERSION: "1.25"
 
 jobs:
   build-and-push:
@@ -17,10 +16,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      - name: Set up Go
+      - id: setup-go
+        name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: go.mod
 
       - name: Build binaries and make Dockerfile
         run: |
@@ -30,7 +30,7 @@ jobs:
           echo "$DOCKERFILE" > Dockerfile
         env:
           DOCKERFILE: |
-            FROM golang:${{env.GO_VERSION}}-alpine AS certs
+            FROM golang:${{ steps.setup-go.outputs.go-version }}-alpine AS certs
             FROM scratch
             
             ARG GOARCH

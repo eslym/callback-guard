@@ -21,8 +21,25 @@ code.
 - Acts as an outbound HTTP proxy for services that need to fetch or relay URLs provided by external callbacks.
 - Resolves hosts and blocks requests that would reach private/internal IP ranges unless they are explicitly whitelisted.
 - Supports a host whitelist to allow certain known destinations even if their resolved IPs would otherwise be blocked.
+- Supports a blacklist (denylist) to explicitly block hosts or IP ranges — blacklist rules take precedence over whitelist rules.
 - Optional basic proxy authentication to restrict who can use the proxy.
 - Lightweight, configurable, and can watch and reload configuration at runtime (when enabled).
+
+### Blacklist (denylist)
+
+The blacklist provides a way to explicitly deny destinations even if they would otherwise be permitted by the whitelist.
+It accepts the same configuration shapes and host-pattern semantics as the whitelist:
+
+- `blacklist.ip` — list of IPs or CIDR ranges (e.g. `10.0.0.0/8`, `192.0.2.1`).
+- `blacklist.host` — list of host patterns. Patterns use simple wildcard matching (same rules as the whitelist).
+
+Host pattern semantics:
+- A pattern without a port (e.g. `internal.example.com` or `*.example.com`) only matches when the destination port is 80 or 443.
+- A pattern with an explicit port (e.g. `example.com:8080` or `*.example.com:8443`) matches the host:port combination.
+
+Priority rules:
+- Blacklist checks run before whitelist checks. If a host pattern matches the blacklist or any resolved IP falls within a
+  blacklisted CIDR, the request is denied immediately regardless of whitelist entries.
 
 ## When to use it
 
@@ -45,14 +62,33 @@ code.
    # auth: false    # or provide a map of username:bcrypt-hash
    ```
 
-2) Start the proxy
+2) Config with blacklist example
+
+   ```yaml
+   listen: ":8080"
+   handle_redirect: true
+   whitelist:
+     ip: [ "203.0.113.0/24" ]
+     host: [ "allowed.example.com", "*.partners.example.org" ]
+   blacklist:
+     ip: [ "10.0.0.0/8", "192.168.0.0/16" ]
+     host: [ "bad.example.com", "*.malicious.local" ]
+   # auth: { "proxyuser": "$2a$10$..." }
+   ```
+
+   Notes:
+   - In the example above, any request that matches `blacklist.host` or resolves to an IP in `blacklist.ip` will be
+     rejected even if the same host or IP also appears in the whitelist. This enforces a deny-first model for explicitly
+     blocked destinations.
+
+3) Start the proxy
 
    Run the binary pointing at your config:
    ```shell
    callback-guard -config config.yaml
    ```
 
-3) Generate a bcrypt password hash (for auth entries)
+4) Generate a bcrypt password hash (for auth entries)
 
    The binary includes a helper to generate bcrypt hashes for credentials used in the config. For an interactive prompt
    or
@@ -76,6 +112,8 @@ code.
 - Keep an audit log of which services are permitted to use the proxy (combine with network-level controls and
   authentication).
 - The project intentionally focuses on request safety and simplicity rather than being a full-featured forward proxy.
+- Use the blacklist to explicitly deny known-bad hosts or private ranges you want to ensure are never contacted even if
+  a whitelist might otherwise permit them.
 
 ## License
 

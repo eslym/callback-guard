@@ -6,8 +6,7 @@ on:
       - "*"
 
 env:
-  IMAGE: eslym/callback-guard
-  CACHE: eslym/callback-guard:buildcache
+  IMAGE: ${{ secrets.DOCKER_USERNAME }}/callback-guard
 
 jobs:
   build-and-push:

@@ -8,7 +8,7 @@ on:
 env:
   IMAGE: eslym/callback-guard
   CACHE: eslym/callback-guard:buildcache
-  GO_VERSION: 1.25
+  GO_VERSION: "1.25"
 
 jobs:
   build-and-push:

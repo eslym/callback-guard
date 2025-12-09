@@ -881,13 +881,26 @@ func main() {
 		return
 	}
 
-	configPath := flag.String("config", "config.yaml", "path to config file")
+	// Make --config optional. When -watch is set, --config is required.
+	configPath := flag.String("config", "", "path to config file (required when -watch)")
 	watch := flag.Bool("watch", false, "watch config and auto-reload")
 	flag.Parse()
 
-	cfg, err := loadConfig(*configPath)
-	if err != nil {
-		log.Fatalf("failed to load config %s: %v", *configPath, err)
+	var cfg *Config
+	if *configPath == "" {
+		if *watch {
+			log.Fatalf("-watch requires --config to be set")
+		}
+		// No config provided and not watching: use sane defaults in-memory.
+		cfg = &Config{
+			Listen: ":8080",
+		}
+	} else {
+		var err error
+		cfg, err = loadConfig(*configPath)
+		if err != nil {
+			log.Fatalf("failed to load config %s: %v", *configPath, err)
+		}
 	}
 
 	authSettings, err := buildAuthSettings(cfg.Auth)
@@ -953,6 +966,7 @@ func main() {
 	}
 
 	if *watch {
+		// watch requires a config path; this is already enforced above
 		go watchConfig(*configPath, &handler)
 	}
 

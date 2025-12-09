@@ -21,7 +21,8 @@ code.
 - Acts as an outbound HTTP proxy for services that need to fetch or relay URLs provided by external callbacks.
 - Resolves hosts and blocks requests that would reach private/internal IP ranges unless they are explicitly whitelisted.
 - Supports a host whitelist to allow certain known destinations even if their resolved IPs would otherwise be blocked.
-- Supports a blacklist (denylist) to explicitly block hosts or IP ranges — blacklist rules take precedence over whitelist rules.
+- Supports a blacklist (denylist) to explicitly block hosts or IP ranges — blacklist rules take precedence over
+  whitelist rules.
 - Optional basic proxy authentication to restrict who can use the proxy.
 - Lightweight, configurable, and can watch and reload configuration at runtime (when enabled).
 
@@ -32,11 +33,13 @@ entries that apply specifically to requests authenticated as a given user. This 
 internal services need distinct outbound rules.
 
 Where to configure:
+
 - Add an `overrides` mapping in your YAML config. Each key is a username (matching the username clients present via
   Proxy Basic auth). The value is an object with `whitelist` and `blacklist` sections using the same `ip` and `host`
   shapes as the global config.
 
 Precedence rules (applied in this exact order):
+
 1. User-scoped host blacklist (deny)
 2. User-scoped IP blacklist (deny)
 3. User-scoped host whitelist (allow)
@@ -47,9 +50,12 @@ Precedence rules (applied in this exact order):
 8. Global IP whitelist (allow)
 
 Notes on semantics:
-- Blacklists are conservative: if any resolved IP for a hostname appears in a blacklist (user or global), the request is denied.
+
+- Blacklists are conservative: if any resolved IP for a hostname appears in a blacklist (user or global), the request is
+  denied.
 - Host patterns without an explicit port only match when the destination port is 80 or 443 (same as global host rules).
-- Per-user overrides are considered only when the request is authenticated and the username matches an entry in `overrides`.
+- Per-user overrides are considered only when the request is authenticated and the username matches an entry in
+  `overrides`.
   If the proxy is running without auth enabled, `overrides` has no effect.
 
 Example per-user overrides (config.yaml):
@@ -59,7 +65,7 @@ listen: ":8080"
 handle_redirect: true
 auth:
   alice: "$2a$10$..."   # bcrypt hash for user "alice"
-  bob:   "$2a$10$..."
+  bob: "$2a$10$..."
 
 whitelist:
   ip: [ "203.0.113.0/24" ]
@@ -83,11 +89,54 @@ overrides:
 ```
 
 Behavior examples:
+
 - A request authenticated as `alice` to `internal.example.com:80` will be allowed by the user host whitelist even if the
   global policy would block its resolved IPs.
 - A request authenticated as `bob` to `10.1.2.3` will be denied because `bob`'s user IP blacklist contains `10.0.0.0/8`.
-- A request authenticated as `alice` to `danger.internal.local` will be denied due to `alice`'s user host blacklist (user-level
+- A request authenticated as `alice` to `danger.internal.local` will be denied due to `alice`'s user host blacklist (
+  user-level
   blacklist takes precedence over user whitelist and global lists).
+
+## CLI and flags
+
+The proxy has two main flags that control configuration loading and live reloads:
+
+- `--config <path>`: path to a YAML config file. This flag is optional when not using `--watch`.
+- `--watch`: enable watching the config file and live-reloading on changes. When `--watch` is used, `--config` is
+  required.
+
+Behavior summary:
+
+- If `--config` is omitted and `--watch` is not set, the proxy runs with a small in-memory default config:
+    - `listen: ":8080"`
+    - no auth configured
+    - empty whitelist and blacklist lists
+
+  This mode is convenient for quick local testing, but production use should provide a config file.
+
+- If `--config` is provided, the proxy loads that YAML and applies its rules (and `--watch` can be used to reload it).
+- If `--watch` is set but `--config` is not provided, the program will exit with an error — live reload requires a file
+  to watch.
+
+Examples:
+
+- Run with default in-memory config (no file):
+
+```powershell
+.\callback-guard.exe
+```
+
+- Run with a config file (no watching):
+
+```powershell
+.\callback-guard.exe -config .\config.yaml
+```
+
+- Run with a config file and live reload:
+
+```powershell
+.\callback-guard.exe -config .\config.yaml -watch
+```
 
 ## Blacklist (denylist)
 
@@ -98,11 +147,15 @@ It accepts the same configuration shapes and host-pattern semantics as the white
 - `blacklist.host` — list of host patterns. Patterns use simple wildcard matching (same rules as the whitelist).
 
 Host pattern semantics:
-- A pattern without a port (e.g. `internal.example.com` or `*.example.com`) only matches when the destination port is 80 or 443.
+
+- A pattern without a port (e.g. `internal.example.com` or `*.example.com`) only matches when the destination port is 80
+  or 443.
 - A pattern with an explicit port (e.g. `example.com:8080` or `*.example.com:8443`) matches the host:port combination.
 
 Priority rules:
-- Blacklist checks run before whitelist checks. If a host pattern matches the blacklist or any resolved IP falls within a
+
+- Blacklist checks run before whitelist checks. If a host pattern matches the blacklist or any resolved IP falls within
+  a
   blacklisted CIDR, the request is denied immediately regardless of whitelist entries.
 
 ## When to use it
@@ -141,9 +194,10 @@ Priority rules:
    ```
 
    Notes:
-   - In the example above, any request that matches `blacklist.host` or resolves to an IP in `blacklist.ip` will be
-     rejected even if the same host or IP also appears in the whitelist. This enforces a deny-first model for explicitly
-     blocked destinations.
+    - In the example above, any request that matches `blacklist.host` or resolves to an IP in `blacklist.ip` will be
+      rejected even if the same host or IP also appears in the whitelist. This enforces a deny-first model for
+      explicitly
+      blocked destinations.
 
 3) Start the proxy
 

@@ -38,13 +38,20 @@ type WhitelistConfig struct {
 	Host []string `yaml:"host"`
 }
 
+// Per-user override entry in YAML
+type OverrideEntry struct {
+	Whitelist WhitelistConfig `yaml:"whitelist"`
+	Blacklist WhitelistConfig `yaml:"blacklist"`
+}
+
 type Config struct {
-	Listen         string          `yaml:"listen"`
-	Auth           interface{}     `yaml:"auth"` // map[string]string | false | null
-	HandleRedirect bool            `yaml:"handle_redirect"`
-	Timeout        TimeoutConfig   `yaml:"timeout"`
-	Whitelist      WhitelistConfig `yaml:"whitelist"`
-	Blacklist      WhitelistConfig `yaml:"blacklist"`
+	Listen         string                   `yaml:"listen"`
+	Auth           interface{}              `yaml:"auth"` // map[string]string | false | null
+	HandleRedirect bool                     `yaml:"handle_redirect"`
+	Timeout        TimeoutConfig            `yaml:"timeout"`
+	Whitelist      WhitelistConfig          `yaml:"whitelist"`
+	Blacklist      WhitelistConfig          `yaml:"blacklist"`
+	Overrides      map[string]OverrideEntry `yaml:"overrides"`
 }
 
 // -------------------------
@@ -153,6 +160,10 @@ func parseHostWhitelist(list []string) []string {
 	}
 	return out
 }
+
+// -------------------------
+// Auth settings
+// -------------------------
 
 type AuthSettings struct {
 	Enabled bool
@@ -276,13 +287,27 @@ func hostInList(host, port string, patterns []string) bool {
 // DNS + dialing
 // -------------------------
 
+type UserOverrides struct {
+	ipWhitelist   []*net.IPNet
+	hostWhitelist []string
+	ipBlacklist   []*net.IPNet
+	hostBlacklist []string
+}
+
 type SafeDialer struct {
 	inner         net.Dialer
 	ipWhitelist   []*net.IPNet
 	hostWhitelist []string
 	ipBlacklist   []*net.IPNet
 	hostBlacklist []string
+	// per-user overrides
+	userOverrides map[string]*UserOverrides
 }
+
+// Context key for authenticated username
+type contextKey string
+
+const userContextKey contextKey = "proxy-user"
 
 func (sd *SafeDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(address)
@@ -290,18 +315,59 @@ func (sd *SafeDialer) DialContext(ctx context.Context, network, address string) 
 		return nil, fmt.Errorf("invalid address %q: %w", address, err)
 	}
 
-	// If host pattern explicitly blacklists this host: deny immediately.
+	// Try to obtain authenticated username from context
+	var ips []net.IP
+	user, _ := ctx.Value(userContextKey).(string)
+	if user != "" {
+		if uo, ok := sd.userOverrides[user]; ok {
+			// user host blacklist -> immediate deny
+			if hostInList(host, port, uo.hostBlacklist) {
+				return nil, fmt.Errorf("host %q is blacklisted for user %s", host, user)
+			}
+
+			// Resolve host into IPs (works for IP literal too).
+			ips, err = resolveHost(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+
+			// If any resolved IP is blacklisted for user, deny immediately.
+			for _, ip := range ips {
+				if ipInNets(ip, uo.ipBlacklist) {
+					return nil, fmt.Errorf("host %q resolves to blacklisted IP %s for user %s", host, ip.String(), user)
+				}
+			}
+
+			// User whitelisted host -> allow (fast path)
+			if hostInList(host, port, uo.hostWhitelist) {
+				return sd.inner.DialContext(ctx, network, address)
+			}
+
+			// User IP whitelist -> allow if any resolved IP is allowed per user whitelist
+			for _, ip := range ips {
+				if isAllowedIP(ip, uo.ipWhitelist) {
+					dest := net.JoinHostPort(ip.String(), port)
+					return sd.inner.DialContext(ctx, network, dest)
+				}
+			}
+			// user override did not grant or deny -> fallthrough to global checks below using the resolved ips
+		}
+	}
+
+	// If host pattern explicitly blacklists this host: deny immediately (global blacklist)
 	if hostInList(host, port, sd.hostBlacklist) {
 		return nil, fmt.Errorf("host %q is blacklisted", host)
 	}
 
-	// Resolve host into IPs (works for IP literal too).
-	ips, err := resolveHost(ctx, host)
-	if err != nil {
-		return nil, err
+	// Resolve host into IPs if we haven't already via user override
+	if ips == nil {
+		ips, err = resolveHost(ctx, host)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	// If any resolved IP is blacklisted, deny immediately (blacklist overrides whitelist).
+	// If any resolved IP is blacklisted globally, deny immediately (blacklist overrides whitelist).
 	for _, ip := range ips {
 		if ipInNets(ip, sd.ipBlacklist) {
 			return nil, fmt.Errorf("host %q resolves to blacklisted IP %s", host, ip.String())
@@ -355,6 +421,7 @@ func newProxyServer(
 	hostWhitelist []string,
 	ipBlacklist []*net.IPNet,
 	hostBlacklist []string,
+	userOverrides map[string]*UserOverrides,
 	auth *AuthSettings,
 	handleRedirect bool,
 ) *ProxyServer {
@@ -367,6 +434,7 @@ func newProxyServer(
 		hostWhitelist: hostWhitelist,
 		ipBlacklist:   ipBlacklist,
 		hostBlacklist: hostBlacklist,
+		userOverrides: userOverrides,
 	}
 
 	tr := &http.Transport{
@@ -393,8 +461,14 @@ func newProxyServer(
 }
 
 func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !p.checkAuth(w, r) {
+	ok, user := p.checkAuth(w, r)
+	if !ok {
 		return
+	}
+
+	// Attach authenticated username (if any) to the request context so DialContext can consult user overrides.
+	if user != "" {
+		r = r.WithContext(context.WithValue(r.Context(), userContextKey, user))
 	}
 
 	if r.Method == http.MethodConnect {
@@ -406,37 +480,38 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // Proxy auth via Proxy-Authorization: Basic <base64(user:pass)>
-func (p *ProxyServer) checkAuth(w http.ResponseWriter, r *http.Request) bool {
+// returns (ok, username)
+func (p *ProxyServer) checkAuth(w http.ResponseWriter, r *http.Request) (bool, string) {
 	if !p.authEnabled {
-		return true
+		return true, ""
 	}
 
 	h := r.Header.Get("Proxy-Authorization")
 	if h == "" {
 		w.Header().Set("Proxy-Authenticate", `Basic realm="proxy"`)
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
-		return false
+		return false, ""
 	}
 
 	const prefix = "Basic "
 	if !strings.HasPrefix(h, prefix) {
 		w.Header().Set("Proxy-Authenticate", `Basic realm="proxy"`)
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
-		return false
+		return false, ""
 	}
 
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(h[len(prefix):]))
 	if err != nil {
 		w.Header().Set("Proxy-Authenticate", `Basic realm="proxy"`)
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
-		return false
+		return false, ""
 	}
 
 	parts := strings.SplitN(string(raw), ":", 2)
 	if len(parts) != 2 {
 		w.Header().Set("Proxy-Authenticate", `Basic realm="proxy"`)
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
-		return false
+		return false, ""
 	}
 	user, pass := parts[0], parts[1]
 
@@ -444,12 +519,12 @@ func (p *ProxyServer) checkAuth(w http.ResponseWriter, r *http.Request) bool {
 	if !ok || bcrypt.CompareHashAndPassword(hash, []byte(pass)) != nil {
 		w.Header().Set("Proxy-Authenticate", `Basic realm="proxy"`)
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
-		return false
+		return false, ""
 	}
 
 	// Don't forward internal auth header upstream.
 	r.Header.Del("Proxy-Authorization")
-	return true
+	return true, user
 }
 
 // Handle HTTP (non-CONNECT)
@@ -694,7 +769,22 @@ func watchConfig(path string, handler *atomic.Value) {
 			ipBlacklist := parseIPWhitelist(cfg.Blacklist.IP)
 			hostBlacklist := parseHostWhitelist(cfg.Blacklist.Host)
 
-			newProxy := newProxyServer(ipWhitelist, hostWhitelist, ipBlacklist, hostBlacklist, authSettings, cfg.HandleRedirect)
+			// parse per-user overrides
+			userOverrides := make(map[string]*UserOverrides, len(cfg.Overrides))
+			for user, entry := range cfg.Overrides {
+				uipW := parseIPWhitelist(entry.Whitelist.IP)
+				hipW := parseHostWhitelist(entry.Whitelist.Host)
+				uipB := parseIPWhitelist(entry.Blacklist.IP)
+				hipB := parseHostWhitelist(entry.Blacklist.Host)
+				userOverrides[user] = &UserOverrides{
+					ipWhitelist:   uipW,
+					hostWhitelist: hipW,
+					ipBlacklist:   uipB,
+					hostBlacklist: hipB,
+				}
+			}
+
+			newProxy := newProxyServer(ipWhitelist, hostWhitelist, ipBlacklist, hostBlacklist, userOverrides, authSettings, cfg.HandleRedirect)
 			handler.Store(http.Handler(newProxy))
 
 			log.Printf("reloaded config from %s", path)
@@ -810,11 +900,26 @@ func main() {
 	ipBlacklist := parseIPWhitelist(cfg.Blacklist.IP)
 	hostBlacklist := parseHostWhitelist(cfg.Blacklist.Host)
 
+	// parse per-user overrides
+	userOverrides := make(map[string]*UserOverrides, len(cfg.Overrides))
+	for user, entry := range cfg.Overrides {
+		uipW := parseIPWhitelist(entry.Whitelist.IP)
+		hipW := parseHostWhitelist(entry.Whitelist.Host)
+		uipB := parseIPWhitelist(entry.Blacklist.IP)
+		hipB := parseHostWhitelist(entry.Blacklist.Host)
+		userOverrides[user] = &UserOverrides{
+			ipWhitelist:   uipW,
+			hostWhitelist: hipW,
+			ipBlacklist:   uipB,
+			hostBlacklist: hipB,
+		}
+	}
+
 	readTimeout := parseDurationOrDefault(cfg.Timeout.Read, 10*time.Second, "read")
 	writeTimeout := parseDurationOrDefault(cfg.Timeout.Write, 10*time.Second, "write")
 	idleTimeout := parseDurationOrDefault(cfg.Timeout.Idle, 60*time.Second, "idle")
 
-	proxy := newProxyServer(ipWhitelist, hostWhitelist, ipBlacklist, hostBlacklist, authSettings, cfg.HandleRedirect)
+	proxy := newProxyServer(ipWhitelist, hostWhitelist, ipBlacklist, hostBlacklist, userOverrides, authSettings, cfg.HandleRedirect)
 
 	var handler atomic.Value
 	handler.Store(http.Handler(proxy))

@@ -44,6 +44,7 @@ type Config struct {
 	HandleRedirect bool            `yaml:"handle_redirect"`
 	Timeout        TimeoutConfig   `yaml:"timeout"`
 	Whitelist      WhitelistConfig `yaml:"whitelist"`
+	Blacklist      WhitelistConfig `yaml:"blacklist"`
 }
 
 // -------------------------
@@ -207,8 +208,9 @@ func isPrivateIP(ip net.IP) bool {
 	return false
 }
 
-func isWhitelistedIP(ip net.IP, whitelist []*net.IPNet) bool {
-	for _, n := range whitelist {
+// unified helper that checks if an IP is contained in any of the provided networks
+func ipInNets(ip net.IP, nets []*net.IPNet) bool {
+	for _, n := range nets {
 		if n.Contains(ip) {
 			return true
 		}
@@ -220,7 +222,7 @@ func isAllowedIP(ip net.IP, whitelist []*net.IPNet) bool {
 	if !isPrivateIP(ip) {
 		return true
 	}
-	return isWhitelistedIP(ip, whitelist)
+	return ipInNets(ip, whitelist)
 }
 
 func wildcardMatch(pattern, s string) bool {
@@ -231,13 +233,13 @@ func wildcardMatch(pattern, s string) bool {
 	return ok
 }
 
-// host:port is checked against patterns from host whitelist.
+// host:port is checked against patterns from host list (whitelist/blacklist).
 //
 // Semantics:
 //   - "*" (no port) matches any host, but ONLY when dst port is 80 or 443.
 //   - If pattern has "host:port", it's matched against "host:port" (with wildcard).
 //   - If pattern has no ":", it's matched against host only, but ONLY when dst port is 80 or 443.
-func hostInWhitelist(host, port string, patterns []string) bool {
+func hostInList(host, port string, patterns []string) bool {
 	if len(patterns) == 0 {
 		return false
 	}
@@ -278,6 +280,8 @@ type SafeDialer struct {
 	inner         net.Dialer
 	ipWhitelist   []*net.IPNet
 	hostWhitelist []string
+	ipBlacklist   []*net.IPNet
+	hostBlacklist []string
 }
 
 func (sd *SafeDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
@@ -286,14 +290,27 @@ func (sd *SafeDialer) DialContext(ctx context.Context, network, address string) 
 		return nil, fmt.Errorf("invalid address %q: %w", address, err)
 	}
 
-	// Whitelisted host: skip private IP check, still dial per-request.
-	if hostInWhitelist(host, port, sd.hostWhitelist) {
-		return sd.inner.DialContext(ctx, network, address)
+	// If host pattern explicitly blacklists this host: deny immediately.
+	if hostInList(host, port, sd.hostBlacklist) {
+		return nil, fmt.Errorf("host %q is blacklisted", host)
 	}
 
+	// Resolve host into IPs (works for IP literal too).
 	ips, err := resolveHost(ctx, host)
 	if err != nil {
 		return nil, err
+	}
+
+	// If any resolved IP is blacklisted, deny immediately (blacklist overrides whitelist).
+	for _, ip := range ips {
+		if ipInNets(ip, sd.ipBlacklist) {
+			return nil, fmt.Errorf("host %q resolves to blacklisted IP %s", host, ip.String())
+		}
+	}
+
+	// Whitelisted host: allow (fast path) since we've already asserted no blacklisted IPs.
+	if hostInList(host, port, sd.hostWhitelist) {
+		return sd.inner.DialContext(ctx, network, address)
 	}
 
 	for _, ip := range ips {
@@ -336,6 +353,8 @@ type ProxyServer struct {
 func newProxyServer(
 	ipWhitelist []*net.IPNet,
 	hostWhitelist []string,
+	ipBlacklist []*net.IPNet,
+	hostBlacklist []string,
 	auth *AuthSettings,
 	handleRedirect bool,
 ) *ProxyServer {
@@ -346,6 +365,8 @@ func newProxyServer(
 		},
 		ipWhitelist:   ipWhitelist,
 		hostWhitelist: hostWhitelist,
+		ipBlacklist:   ipBlacklist,
+		hostBlacklist: hostBlacklist,
 	}
 
 	tr := &http.Transport{
@@ -670,8 +691,10 @@ func watchConfig(path string, handler *atomic.Value) {
 
 			ipWhitelist := parseIPWhitelist(cfg.Whitelist.IP)
 			hostWhitelist := parseHostWhitelist(cfg.Whitelist.Host)
+			ipBlacklist := parseIPWhitelist(cfg.Blacklist.IP)
+			hostBlacklist := parseHostWhitelist(cfg.Blacklist.Host)
 
-			newProxy := newProxyServer(ipWhitelist, hostWhitelist, authSettings, cfg.HandleRedirect)
+			newProxy := newProxyServer(ipWhitelist, hostWhitelist, ipBlacklist, hostBlacklist, authSettings, cfg.HandleRedirect)
 			handler.Store(http.Handler(newProxy))
 
 			log.Printf("reloaded config from %s", path)
@@ -784,12 +807,14 @@ func main() {
 
 	ipWhitelist := parseIPWhitelist(cfg.Whitelist.IP)
 	hostWhitelist := parseHostWhitelist(cfg.Whitelist.Host)
+	ipBlacklist := parseIPWhitelist(cfg.Blacklist.IP)
+	hostBlacklist := parseHostWhitelist(cfg.Blacklist.Host)
 
 	readTimeout := parseDurationOrDefault(cfg.Timeout.Read, 10*time.Second, "read")
 	writeTimeout := parseDurationOrDefault(cfg.Timeout.Write, 10*time.Second, "write")
 	idleTimeout := parseDurationOrDefault(cfg.Timeout.Idle, 60*time.Second, "idle")
 
-	proxy := newProxyServer(ipWhitelist, hostWhitelist, authSettings, cfg.HandleRedirect)
+	proxy := newProxyServer(ipWhitelist, hostWhitelist, ipBlacklist, hostBlacklist, authSettings, cfg.HandleRedirect)
 
 	var handler atomic.Value
 	handler.Store(http.Handler(proxy))
@@ -814,6 +839,12 @@ func main() {
 	}
 	if len(hostWhitelist) > 0 {
 		log.Printf("Host whitelist patterns: %v", hostWhitelist)
+	}
+	if len(ipBlacklist) > 0 {
+		log.Printf("IP blacklist entries: %d", len(ipBlacklist))
+	}
+	if len(hostBlacklist) > 0 {
+		log.Printf("Host blacklist patterns: %v", hostBlacklist)
 	}
 
 	if *watch {

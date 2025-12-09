@@ -30,7 +30,7 @@ jobs:
           echo "$DOCKERFILE" > Dockerfile
         env:
           DOCKERFILE: |
-            FROM golang:${{GO_VERSION}}-alpine AS certs
+            FROM golang:${{env.GO_VERSION}}-alpine AS certs
             FROM scratch
             
             ARG GOARCH

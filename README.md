@@ -266,6 +266,61 @@ Priority rules:
       ```
       Add the produced hash into your config under the `auth` map.
 
+## Docker
+
+This project publishes a Docker image (see the repository's GitHub Actions workflow) as `eslym/callback-guard`.
+The CI builds multi-architecture images (linux/amd64 and linux/arm64) and publishes a manifest so the correct image is
+pulled for the host platform.
+
+The container image expects the configuration file to be available at `/config.yaml` by default (the image sets
+`CALLBACK_GUARD_CONFIG=/config.yaml`). The recommended way to run the container is to mount your `config.yaml` into
+that path.
+
+Run (Linux / macOS):
+
+```bash
+# Run with a mounted config file (recommended)
+docker run --rm -p 8080:8080 \
+  -v "$(pwd)/config.yaml:/config.yaml:ro" \
+  eslym/callback-guard:latest
+```
+
+Run (PowerShell on Windows):
+
+```powershell
+# Use an absolute path for Windows; ensure you replace the path with your config's path
+docker run --rm -p 8080:8080 \
+  -v ${PWD}\config.yaml:/config.yaml:ro \
+  eslym/callback-guard:latest
+```
+
+If you prefer, explicitly set the env var (overrides the image's default):
+
+```bash
+docker run --rm -p 8080:8080 \
+  -v "$(pwd)/my-config.yaml:/my-config.yaml:ro" \
+  -e CALLBACK_GUARD_CONFIG=/my-config.yaml \
+  eslym/callback-guard:latest
+```
+
+Enable live-reload in the container by setting `CALLBACK_GUARD_WATCH=true` or passing `-watch` to the binary, but note
+that `-watch` requires that the config file exists at container start. If you set watch=true but do not mount the
+config file, the container will exit with an error. Example docker-compose snippet:
+
+```yaml
+version: '3.8'
+services:
+  callback-guard:
+    image: eslym/callback-guard:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/config.yaml:ro
+    environment:
+      - CALLBACK_GUARD_CONFIG=/config.yaml
+      - CALLBACK_GUARD_WATCH=true
+```
+
 ## Notes and best practices
 
 - Treat this proxy as a safety boundary: combine host and IP allowlists with application-level validations when

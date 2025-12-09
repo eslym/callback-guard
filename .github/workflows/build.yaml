@@ -38,6 +38,8 @@ jobs:
             COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
             COPY --chmod=+x bin/callback-guard-${GOARCH} /callback-guard
             
+            ENV CALLBACK_GUARD_CONFIG=/config.yaml
+            
             ENTRYPOINT ["/callback-guard"]
 
       - name: Extract Docker metadata (tags & labels)
@@ -46,7 +48,9 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=latest
+            type=semver,pattern=v{{major}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=semver,pattern=v{{version}}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

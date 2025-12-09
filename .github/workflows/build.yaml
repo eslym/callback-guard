@@ -1,0 +1,93 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    tags:
+      - "*"
+
+env:
+  IMAGE: eslym/callback-guard
+  CACHE: eslym/callback-guard:buildcache
+  GO_VERSION: 1.25
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build binaries and make Dockerfile
+        run: |
+          mkdir -p bin
+          GOOS=linux GOARCH=amd64 go build -o bin/callback-guard-amd64 main.go
+          GOOS=linux GOARCH=arm64 go build -o bin/callback-guard-arm64 main.go
+          echo "$DOCKERFILE" > Dockerfile
+        env:
+          DOCKERFILE: |
+            FROM golang:${GO_VERSION}-alpine AS certs
+            FROM scratch
+            
+            ARG GOARCH
+            
+            COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+            COPY --chmod=+x bin/callback-guard-${GOARCH} /callback-guard
+            
+            ENTRYPOINT ["/callback-guard"]
+
+      - name: Extract Docker metadata (tags & labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build amd64 and push by digest
+        id: build-x64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ env.IMAGE }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          platforms: linux/amd64
+          build-args: |
+            GOARCH=amd64
+
+      - name: Build arm64 and push by digest
+        id: build-arm
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ env.IMAGE }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          platforms: linux/arm64
+          build-args: |
+            GOARCH=arm64
+
+      - name: Create manifest list and push
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            ${{ env.IMAGE }}@${{ steps.build-x64.outputs.digest }} \
+            ${{ env.IMAGE }}@${{ steps.build-arm.outputs.digest }}

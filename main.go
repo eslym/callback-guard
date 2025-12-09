@@ -38,7 +38,7 @@ type WhitelistConfig struct {
 	Host []string `yaml:"host"`
 }
 
-// Per-user override entry in YAML
+// OverrideEntry Per-user override entry in YAML
 type OverrideEntry struct {
 	Whitelist WhitelistConfig `yaml:"whitelist"`
 	Blacklist WhitelistConfig `yaml:"blacklist"`

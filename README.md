@@ -105,12 +105,16 @@ The proxy can be configured via flags or environment variables. There are two re
   `CALLBACK_GUARD_CONFIG` for a default path.
 - `--watch`: enable watching the config file and live-reloading on changes. If omitted, the program will consult the
   environment variable `CALLBACK_GUARD_WATCH` (parsed as a boolean).
+- `--verbose`: enable verbose traffic logging. If omitted, the program will consult the environment variable
+  `CALLBACK_GUARD_VERBOSE` (parsed as a boolean).
 
 Behavior summary (new):
 
 - `CALLBACK_GUARD_CONFIG` supplies the default value for `--config` when the flag is not provided.
 - `CALLBACK_GUARD_WATCH` supplies the default for `--watch` when the flag is not provided. Standard boolean values are
   supported (`true`, `false`, `1`, `0`, etc.).
+- `CALLBACK_GUARD_VERBOSE` supplies the default for `--verbose` when the flag is not provided. Standard boolean values
+  are supported (`true`, `false`, `1`, `0`, etc.).
 
 Exactly how missing/invalid config values are handled:
 

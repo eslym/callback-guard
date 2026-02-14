@@ -415,6 +415,7 @@ type ProxyServer struct {
 	authEnabled    bool
 	authUsers      map[string][]byte // username -> bcrypt hash
 	handleRedirect bool
+	verbose        bool
 }
 
 func newProxyServer(
@@ -425,6 +426,7 @@ func newProxyServer(
 	userOverrides map[string]*UserOverrides,
 	auth *AuthSettings,
 	handleRedirect bool,
+	verbose bool,
 ) *ProxyServer {
 	sd := &SafeDialer{
 		inner: net.Dialer{
@@ -458,6 +460,7 @@ func newProxyServer(
 		authEnabled:    enabled,
 		authUsers:      users,
 		handleRedirect: handleRedirect,
+		verbose:        verbose,
 	}
 }
 
@@ -473,11 +476,47 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodConnect {
-		p.handleConnect(w, r)
+		p.handleConnect(w, r, user)
 		return
 	}
 
-	p.handleHTTP(w, r)
+	p.handleHTTP(w, r, user)
+}
+
+func requestFrom(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func requestDestination(r *http.Request) string {
+	if r.Method == http.MethodConnect {
+		return r.Host
+	}
+	if r.URL != nil {
+		if dest := r.URL.String(); dest != "" {
+			return dest
+		}
+	}
+	return r.Host
+}
+
+func (p *ProxyServer) logTraffic(r *http.Request, user, result string, elapsed time.Duration, err error) {
+	if !p.verbose {
+		return
+	}
+	if user == "" {
+		user = "-"
+	}
+	from := requestFrom(r)
+	dest := requestDestination(r)
+	if err != nil {
+		log.Printf("%s %s %s %s %s %s err=%v", from, user, r.Method, dest, result, elapsed, err)
+		return
+	}
+	log.Printf("%s %s %s %s %s %s", from, user, r.Method, dest, result, elapsed)
 }
 
 // Proxy auth via Proxy-Authorization: Basic <base64(user:pass)>
@@ -529,7 +568,8 @@ func (p *ProxyServer) checkAuth(w http.ResponseWriter, r *http.Request) (bool, s
 }
 
 // Handle HTTP (non-CONNECT)
-func (p *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
+func (p *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request, user string) {
+	start := time.Now()
 	outReq := r.Clone(r.Context())
 	outReq.RequestURI = ""
 
@@ -554,6 +594,7 @@ func (p *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		resp, err = p.transport.RoundTrip(outReq)
 	}
 	if err != nil {
+		p.logTraffic(r, user, "error", time.Since(start), err)
 		http.Error(w, fmt.Sprintf("proxy error: %v", err), http.StatusBadGateway)
 		return
 	}
@@ -564,12 +605,16 @@ func (p *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+
+	p.logTraffic(r, user, strconv.Itoa(resp.StatusCode), time.Since(start), nil)
 }
 
 // Handle HTTPS via CONNECT tunnel
-func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
+func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request, user string) {
+	start := time.Now()
 	hj, ok := w.(http.Hijacker)
 	if !ok {
+		p.logTraffic(r, user, "error", time.Since(start), fmt.Errorf("hijacking not supported"))
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
 		return
 	}
@@ -577,12 +622,14 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dstConn, err := p.dialer.DialContext(ctx, "tcp", r.Host)
 	if err != nil {
+		p.logTraffic(r, user, "error", time.Since(start), err)
 		http.Error(w, fmt.Sprintf("connect to %s failed: %v", r.Host, err), http.StatusForbidden)
 		return
 	}
 
 	clientConn, buf, err := hj.Hijack()
 	if err != nil {
+		p.logTraffic(r, user, "error", time.Since(start), err)
 		_ = dstConn.Close()
 		return
 	}
@@ -590,9 +637,12 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	if err != nil {
+		p.logTraffic(r, user, "error", time.Since(start), err)
 		_ = dstConn.Close()
 		return
 	}
+
+	p.logTraffic(r, user, "200", time.Since(start), nil)
 
 	go func() {
 		defer closeQuietly(dstConn)
@@ -720,7 +770,7 @@ func copyHeader(dst, src http.Header) {
 // Config watcher
 // -------------------------
 
-func watchConfig(path string, handler *atomic.Value) {
+func watchConfig(path string, handler *atomic.Value, verbose bool) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Printf("config watch error: %v", err)
@@ -785,7 +835,7 @@ func watchConfig(path string, handler *atomic.Value) {
 				}
 			}
 
-			newProxy := newProxyServer(ipWhitelist, hostWhitelist, ipBlacklist, hostBlacklist, userOverrides, authSettings, cfg.HandleRedirect)
+			newProxy := newProxyServer(ipWhitelist, hostWhitelist, ipBlacklist, hostBlacklist, userOverrides, authSettings, cfg.HandleRedirect, verbose)
 			handler.Store(http.Handler(newProxy))
 
 			log.Printf("reloaded config from %s", path)
@@ -890,9 +940,16 @@ func main() {
 			watchDefault = b
 		}
 	}
+	verboseDefault := false
+	if v := os.Getenv("CALLBACK_GUARD_VERBOSE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			verboseDefault = b
+		}
+	}
 
 	configPath := flag.String("config", envConfig, "path to config file (required when -watch)")
 	watch := flag.Bool("watch", watchDefault, "watch config and auto-reload")
+	verbose := flag.Bool("verbose", verboseDefault, "enable verbose traffic logging")
 	flag.Parse()
 
 	var cfg *Config
@@ -954,7 +1011,7 @@ func main() {
 	writeTimeout := parseDurationOrDefault(cfg.Timeout.Write, 10*time.Second, "write")
 	idleTimeout := parseDurationOrDefault(cfg.Timeout.Idle, 60*time.Second, "idle")
 
-	proxy := newProxyServer(ipWhitelist, hostWhitelist, ipBlacklist, hostBlacklist, userOverrides, authSettings, cfg.HandleRedirect)
+	proxy := newProxyServer(ipWhitelist, hostWhitelist, ipBlacklist, hostBlacklist, userOverrides, authSettings, cfg.HandleRedirect, *verbose)
 
 	var handler atomic.Value
 	handler.Store(http.Handler(proxy))
@@ -989,7 +1046,7 @@ func main() {
 
 	if *watch {
 		// watch requires a config path; this is already enforced above
-		go watchConfig(*configPath, &handler)
+		go watchConfig(*configPath, &handler, *verbose)
 	}
 
 	log.Fatal(server.ListenAndServe())

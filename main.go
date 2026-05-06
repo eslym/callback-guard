@@ -66,6 +66,42 @@ type SecurityConfig struct {
 	AuthMaxFailures         int    `yaml:"auth_max_failures"`
 	AuthWindow              string `yaml:"auth_window"`
 	AuthBlockDuration       string `yaml:"auth_block_duration"`
+	ConnectMaxLifetime      string `yaml:"connect_max_lifetime"`
+}
+
+func validateSecurityConfig(sec SecurityConfig) error {
+	for _, p := range sec.AllowedPorts {
+		if p <= 0 || p > 65535 {
+			return fmt.Errorf("security.allowed_ports contains invalid port %d", p)
+		}
+	}
+
+	if sec.AuthRateLimit {
+		if sec.AuthMaxFailures <= 0 {
+			return fmt.Errorf("security.auth_max_failures must be > 0 when security.auth_rate_limit is enabled")
+		}
+		if sec.AuthWindow != "" {
+			d, err := time.ParseDuration(sec.AuthWindow)
+			if err != nil || d <= 0 {
+				return fmt.Errorf("security.auth_window must be a positive duration")
+			}
+		}
+		if sec.AuthBlockDuration != "" {
+			d, err := time.ParseDuration(sec.AuthBlockDuration)
+			if err != nil || d <= 0 {
+				return fmt.Errorf("security.auth_block_duration must be a positive duration")
+			}
+		}
+	}
+
+	if sec.ConnectMaxLifetime != "" {
+		d, err := time.ParseDuration(sec.ConnectMaxLifetime)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("security.connect_max_lifetime must be a positive duration")
+		}
+	}
+
+	return nil
 }
 
 // -------------------------
@@ -464,6 +500,7 @@ type ProxyServer struct {
 	verbose        bool
 	security       SecurityConfig
 	authLimiter    *authLimiter
+	connectMaxLife time.Duration
 }
 
 type authAttempt struct {
@@ -477,6 +514,8 @@ type authLimiter struct {
 	window        time.Duration
 	maxFailures   int
 	blockDuration time.Duration
+	pruneInterval time.Duration
+	lastPrune     time.Time
 }
 
 func newAuthLimiter(window time.Duration, maxFailures int, blockDuration time.Duration) *authLimiter {
@@ -494,12 +533,15 @@ func newAuthLimiter(window time.Duration, maxFailures int, blockDuration time.Du
 		window:        window,
 		maxFailures:   maxFailures,
 		blockDuration: blockDuration,
+		pruneInterval: 5 * time.Minute,
+		lastPrune:     time.Now(),
 	}
 }
 
 func (al *authLimiter) isBlocked(key string, now time.Time) bool {
 	al.mu.Lock()
 	defer al.mu.Unlock()
+	al.pruneIfNeededLocked(now)
 	a := al.entries[key]
 	if a == nil {
 		return false
@@ -513,6 +555,7 @@ func (al *authLimiter) isBlocked(key string, now time.Time) bool {
 func (al *authLimiter) recordFailure(key string, now time.Time) {
 	al.mu.Lock()
 	defer al.mu.Unlock()
+	al.pruneIfNeededLocked(now)
 	a := al.entries[key]
 	if a == nil {
 		a = &authAttempt{}
@@ -537,6 +580,29 @@ func (al *authLimiter) recordSuccess(key string) {
 	al.mu.Lock()
 	defer al.mu.Unlock()
 	delete(al.entries, key)
+}
+
+func (al *authLimiter) pruneIfNeededLocked(now time.Time) {
+	if now.Sub(al.lastPrune) < al.pruneInterval {
+		return
+	}
+	al.lastPrune = now
+	cutoff := now.Add(-al.window)
+	for key, a := range al.entries {
+		if now.Before(a.blockedUntil) {
+			continue
+		}
+		kept := a.failures[:0]
+		for _, ts := range a.failures {
+			if ts.After(cutoff) {
+				kept = append(kept, ts)
+			}
+		}
+		a.failures = kept
+		if len(a.failures) == 0 {
+			delete(al.entries, key)
+		}
+	}
 }
 
 func newProxyServer(
@@ -598,6 +664,11 @@ func newProxyServer(
 		limiter = newAuthLimiter(window, security.AuthMaxFailures, blockDuration)
 	}
 
+	connectMaxLife := time.Duration(0)
+	if security.ConnectMaxLifetime != "" {
+		connectMaxLife = parseDurationOrDefault(security.ConnectMaxLifetime, 0, "security.connect_max_lifetime")
+	}
+
 	return &ProxyServer{
 		transport:      tr,
 		dialer:         sd,
@@ -607,6 +678,7 @@ func newProxyServer(
 		verbose:        verbose,
 		security:       security,
 		authLimiter:    limiter,
+		connectMaxLife: connectMaxLife,
 	}
 }
 
@@ -847,6 +919,11 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request, user
 	}
 
 	ctx := r.Context()
+	if p.connectMaxLife > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.connectMaxLife)
+		defer cancel()
+	}
 	dstConn, err := p.dialer.DialContext(ctx, "tcp", r.Host)
 	if err != nil {
 		p.logTraffic(r, user, "error", time.Since(start), err)
@@ -861,6 +938,13 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request, user
 		return
 	}
 	defer closeQuietly(clientConn)
+	if p.connectMaxLife > 0 {
+		go func() {
+			<-ctx.Done()
+			_ = clientConn.Close()
+			_ = dstConn.Close()
+		}()
+	}
 
 	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	if err != nil {
@@ -1033,6 +1117,10 @@ func watchConfig(path string, handler *atomic.Value, verbose bool) {
 			cfg, err := loadConfig(path)
 			if err != nil {
 				log.Printf("config reload failed: %v", err)
+				continue
+			}
+			if err := validateSecurityConfig(cfg.Security); err != nil {
+				log.Printf("config reload security error: %v", err)
 				continue
 			}
 
@@ -1213,6 +1301,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("auth config error: %v", err)
 	}
+	if err := validateSecurityConfig(cfg.Security); err != nil {
+		log.Fatalf("security config error: %v", err)
+	}
 
 	ipWhitelist := parseIPWhitelist(cfg.Whitelist.IP)
 	hostWhitelist := parseHostWhitelist(cfg.Whitelist.Host)
@@ -1285,6 +1376,9 @@ func main() {
 	}
 	if cfg.Security.AuthRateLimit {
 		log.Printf("security.auth_rate_limit=true")
+	}
+	if cfg.Security.ConnectMaxLifetime != "" {
+		log.Printf("security.connect_max_lifetime=%s", cfg.Security.ConnectMaxLifetime)
 	}
 
 	if *watch {

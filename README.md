@@ -219,6 +219,7 @@ security:
   auth_max_failures: 10
   auth_window: "1m"
   auth_block_duration: "5m"
+  connect_max_lifetime: ""
 ```
 
 - `disable_http2`: disables HTTP/2 for upstream requests made by the proxy transport.
@@ -228,6 +229,7 @@ security:
 - `allowed_ports`: optional destination port allowlist. When set, requests to other ports are denied.
 - `auth_rate_limit`: enables per-client+username authentication failure throttling.
 - `auth_max_failures`, `auth_window`, `auth_block_duration`: tune auth throttling behavior.
+- `connect_max_lifetime`: optional maximum lifetime for CONNECT tunnels (for example `10m`).
 
 Note: host whitelist matches now connect using already-resolved IP addresses to reduce DNS rebinding risk.
 
@@ -243,6 +245,7 @@ security:
   auth_max_failures: 8
   auth_window: "1m"
   auth_block_duration: "10m"
+  connect_max_lifetime: "30m"
 ```
 
 ## When to use it

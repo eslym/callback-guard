@@ -103,3 +103,59 @@ func TestCheckAuthRateLimit(t *testing.T) {
 func bcryptPassword(pass string) ([]byte, error) {
 	return bcrypt.GenerateFromPassword([]byte(pass), bcrypt.DefaultCost)
 }
+
+func TestValidateSecurityConfig(t *testing.T) {
+	t.Run("invalid allowed port", func(t *testing.T) {
+		err := validateSecurityConfig(SecurityConfig{AllowedPorts: []int{443, 70000}})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("invalid auth settings", func(t *testing.T) {
+		err := validateSecurityConfig(SecurityConfig{
+			AuthRateLimit:   true,
+			AuthMaxFailures: 0,
+		})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("invalid connect lifetime", func(t *testing.T) {
+		err := validateSecurityConfig(SecurityConfig{ConnectMaxLifetime: "-5s"})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("valid config", func(t *testing.T) {
+		err := validateSecurityConfig(SecurityConfig{
+			AllowedPorts:       []int{80, 443},
+			AuthRateLimit:      true,
+			AuthMaxFailures:    5,
+			AuthWindow:         "30s",
+			AuthBlockDuration:  "2m",
+			ConnectMaxLifetime: "10m",
+		})
+		if err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+	})
+}
+
+func TestAuthLimiterPrunesEntries(t *testing.T) {
+	al := newAuthLimiter(1*time.Minute, 3, 5*time.Minute)
+	al.pruneInterval = time.Nanosecond
+	now := time.Now()
+	key := "127.0.0.1|bob"
+	al.recordFailure(key, now.Add(-2*time.Minute))
+	al.isBlocked("nope", now)
+
+	al.mu.Lock()
+	_, ok := al.entries[key]
+	al.mu.Unlock()
+	if ok {
+		t.Fatal("expected stale entry to be pruned")
+	}
+}

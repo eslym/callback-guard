@@ -223,7 +223,8 @@ security:
 ```
 
 - `disable_http2`: disables HTTP/2 for upstream requests made by the proxy transport.
-- `strict_request_validation`: rejects malformed proxy requests early (invalid CONNECT target, missing host/scheme).
+- `strict_request_validation`: rejects malformed proxy requests early (invalid CONNECT host/port, non-absolute URLs,
+  missing host/scheme, URL userinfo, invalid destination ports).
 - `block_metadata_endpoints`: blocks common cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`,
   `fd00:ec2::254`) even if they would otherwise be allowed.
 - `allowed_ports`: optional destination port allowlist. When set, requests to other ports are denied.

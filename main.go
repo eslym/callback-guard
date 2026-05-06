@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -710,7 +711,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func validateProxyRequest(r *http.Request) error {
 	if r.Method == http.MethodConnect {
-		if _, _, err := net.SplitHostPort(r.Host); err != nil {
+		if _, _, err := splitAndValidateHostPort(r.Host); err != nil {
 			return fmt.Errorf("invalid CONNECT target")
 		}
 		return nil
@@ -718,13 +719,50 @@ func validateProxyRequest(r *http.Request) error {
 	if r.URL == nil {
 		return fmt.Errorf("missing request URL")
 	}
+	if !r.URL.IsAbs() {
+		return fmt.Errorf("proxy request URL must be absolute")
+	}
 	if r.URL.Scheme != "http" && r.URL.Scheme != "https" {
 		return fmt.Errorf("unsupported URL scheme")
 	}
 	if r.URL.Host == "" {
 		return fmt.Errorf("missing destination host")
 	}
+	if r.URL.User != nil {
+		return fmt.Errorf("userinfo in destination URL is not allowed")
+	}
+	if _, _, err := splitAndValidateHostPort(defaultHostPortForScheme(r.URL)); err != nil {
+		return fmt.Errorf("invalid destination host/port")
+	}
 	return nil
+}
+
+func defaultHostPortForScheme(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	if _, _, err := net.SplitHostPort(u.Host); err == nil {
+		return u.Host
+	}
+	if u.Scheme == "https" {
+		return net.JoinHostPort(u.Host, "443")
+	}
+	return net.JoinHostPort(u.Host, "80")
+}
+
+func splitAndValidateHostPort(hostport string) (string, string, error) {
+	host, port, err := net.SplitHostPort(hostport)
+	if err != nil {
+		return "", "", err
+	}
+	if host == "" {
+		return "", "", fmt.Errorf("empty host")
+	}
+	pn, err := strconv.Atoi(port)
+	if err != nil || pn <= 0 || pn > 65535 {
+		return "", "", fmt.Errorf("invalid port")
+	}
+	return host, port, nil
 }
 
 func requestFrom(r *http.Request) string {
@@ -1339,10 +1377,11 @@ func main() {
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			handler.Load().(http.Handler).ServeHTTP(w, r)
 		}),
-		ReadTimeout:    readTimeout,
-		WriteTimeout:   writeTimeout,
-		IdleTimeout:    idleTimeout,
-		MaxHeaderBytes: 1 << 20,
+		ReadTimeout:       readTimeout,
+		ReadHeaderTimeout: readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	log.Printf("callback-guard listening on %s", cfg.Listen)

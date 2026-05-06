@@ -34,6 +34,30 @@ func TestValidateProxyRequest(t *testing.T) {
 			t.Fatal("expected error")
 		}
 	})
+
+	t.Run("relative URL denied", func(t *testing.T) {
+		u, _ := url.Parse("/local/path")
+		r := &http.Request{Method: http.MethodGet, URL: u}
+		if err := validateProxyRequest(r); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("userinfo denied", func(t *testing.T) {
+		u, _ := url.Parse("http://user:pass@example.com/resource")
+		r := &http.Request{Method: http.MethodGet, URL: u}
+		if err := validateProxyRequest(r); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("invalid destination port denied", func(t *testing.T) {
+		u, _ := url.Parse("http://example.com:70000/resource")
+		r := &http.Request{Method: http.MethodGet, URL: u}
+		if err := validateProxyRequest(r); err == nil {
+			t.Fatal("expected error")
+		}
+	})
 }
 
 func TestIsMetadataEndpoint(t *testing.T) {

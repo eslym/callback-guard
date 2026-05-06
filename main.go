@@ -53,6 +53,13 @@ type Config struct {
 	Whitelist      WhitelistConfig          `yaml:"whitelist"`
 	Blacklist      WhitelistConfig          `yaml:"blacklist"`
 	Overrides      map[string]OverrideEntry `yaml:"overrides"`
+	Security       SecurityConfig           `yaml:"security"`
+}
+
+type SecurityConfig struct {
+	DisableHTTP2            bool `yaml:"disable_http2"`
+	StrictRequestValidation bool `yaml:"strict_request_validation"`
+	BlockMetadataEndpoints  bool `yaml:"block_metadata_endpoints"`
 }
 
 // -------------------------
@@ -301,6 +308,7 @@ type SafeDialer struct {
 	hostWhitelist []string
 	ipBlacklist   []*net.IPNet
 	hostBlacklist []string
+	security      SecurityConfig
 	// per-user overrides
 	userOverrides map[string]*UserOverrides
 }
@@ -339,9 +347,15 @@ func (sd *SafeDialer) DialContext(ctx context.Context, network, address string) 
 				}
 			}
 
-			// User whitelisted host -> allow (fast path)
+			// User whitelisted host -> allow by dialing a resolved IP directly.
 			if hostInList(host, port, uo.hostWhitelist) {
-				return sd.inner.DialContext(ctx, network, address)
+				for _, ip := range ips {
+					if sd.security.BlockMetadataEndpoints && isMetadataEndpoint(host, ip) {
+						return nil, fmt.Errorf("metadata endpoints are blocked")
+					}
+					dest := net.JoinHostPort(ip.String(), port)
+					return sd.inner.DialContext(ctx, network, dest)
+				}
 			}
 
 			// User IP whitelist -> allow if any resolved IP is allowed per user whitelist
@@ -370,14 +384,18 @@ func (sd *SafeDialer) DialContext(ctx context.Context, network, address string) 
 
 	// If any resolved IP is blacklisted globally, deny immediately (blacklist overrides whitelist).
 	for _, ip := range ips {
+		if sd.security.BlockMetadataEndpoints && isMetadataEndpoint(host, ip) {
+			return nil, fmt.Errorf("metadata endpoints are blocked")
+		}
 		if ipInNets(ip, sd.ipBlacklist) {
 			return nil, fmt.Errorf("host %q resolves to blacklisted IP %s", host, ip.String())
 		}
 	}
 
-	// Whitelisted host: allow (fast path) since we've already asserted no blacklisted IPs.
+	// Whitelisted host: allow by dialing a resolved IP directly.
 	if hostInList(host, port, sd.hostWhitelist) {
-		return sd.inner.DialContext(ctx, network, address)
+		dest := net.JoinHostPort(ips[0].String(), port)
+		return sd.inner.DialContext(ctx, network, dest)
 	}
 
 	for _, ip := range ips {
@@ -405,6 +423,22 @@ func resolveHost(ctx context.Context, host string) ([]net.IP, error) {
 	return ips, nil
 }
 
+func isMetadataEndpoint(host string, ip net.IP) bool {
+	h := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	if h == "metadata.google.internal" || h == "metadata" {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		if v4.Equal(net.ParseIP("169.254.169.254").To4()) {
+			return true
+		}
+	}
+	if ip.Equal(net.ParseIP("fd00:ec2::254")) {
+		return true
+	}
+	return false
+}
+
 // -------------------------
 // Proxy server
 // -------------------------
@@ -416,6 +450,7 @@ type ProxyServer struct {
 	authUsers      map[string][]byte // username -> bcrypt hash
 	handleRedirect bool
 	verbose        bool
+	security       SecurityConfig
 }
 
 func newProxyServer(
@@ -427,6 +462,7 @@ func newProxyServer(
 	auth *AuthSettings,
 	handleRedirect bool,
 	verbose bool,
+	security SecurityConfig,
 ) *ProxyServer {
 	sd := &SafeDialer{
 		inner: net.Dialer{
@@ -437,14 +473,20 @@ func newProxyServer(
 		hostWhitelist: hostWhitelist,
 		ipBlacklist:   ipBlacklist,
 		hostBlacklist: hostBlacklist,
+		security:      security,
 		userOverrides: userOverrides,
 	}
 
 	tr := &http.Transport{
-		Proxy:               nil, // no upstream proxy
-		DialContext:         sd.DialContext,
-		ForceAttemptHTTP2:   true,
-		TLSHandshakeTimeout: 10 * time.Second,
+		Proxy:                 nil, // no upstream proxy
+		DialContext:           sd.DialContext,
+		ForceAttemptHTTP2:     !security.DisableHTTP2,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   20,
 	}
 
 	var enabled bool
@@ -461,10 +503,18 @@ func newProxyServer(
 		authUsers:      users,
 		handleRedirect: handleRedirect,
 		verbose:        verbose,
+		security:       security,
 	}
 }
 
 func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if p.security.StrictRequestValidation {
+		if err := validateProxyRequest(r); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
 	ok, user := p.checkAuth(w, r)
 	if !ok {
 		return
@@ -481,6 +531,25 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.handleHTTP(w, r, user)
+}
+
+func validateProxyRequest(r *http.Request) error {
+	if r.Method == http.MethodConnect {
+		if _, _, err := net.SplitHostPort(r.Host); err != nil {
+			return fmt.Errorf("invalid CONNECT target")
+		}
+		return nil
+	}
+	if r.URL == nil {
+		return fmt.Errorf("missing request URL")
+	}
+	if r.URL.Scheme != "http" && r.URL.Scheme != "https" {
+		return fmt.Errorf("unsupported URL scheme")
+	}
+	if r.URL.Host == "" {
+		return fmt.Errorf("missing destination host")
+	}
+	return nil
 }
 
 func requestFrom(r *http.Request) string {
@@ -835,7 +904,7 @@ func watchConfig(path string, handler *atomic.Value, verbose bool) {
 				}
 			}
 
-			newProxy := newProxyServer(ipWhitelist, hostWhitelist, ipBlacklist, hostBlacklist, userOverrides, authSettings, cfg.HandleRedirect, verbose)
+			newProxy := newProxyServer(ipWhitelist, hostWhitelist, ipBlacklist, hostBlacklist, userOverrides, authSettings, cfg.HandleRedirect, verbose, cfg.Security)
 			handler.Store(http.Handler(newProxy))
 
 			log.Printf("reloaded config from %s", path)
@@ -1011,7 +1080,7 @@ func main() {
 	writeTimeout := parseDurationOrDefault(cfg.Timeout.Write, 10*time.Second, "write")
 	idleTimeout := parseDurationOrDefault(cfg.Timeout.Idle, 60*time.Second, "idle")
 
-	proxy := newProxyServer(ipWhitelist, hostWhitelist, ipBlacklist, hostBlacklist, userOverrides, authSettings, cfg.HandleRedirect, *verbose)
+	proxy := newProxyServer(ipWhitelist, hostWhitelist, ipBlacklist, hostBlacklist, userOverrides, authSettings, cfg.HandleRedirect, *verbose, cfg.Security)
 
 	var handler atomic.Value
 	handler.Store(http.Handler(proxy))
@@ -1021,9 +1090,10 @@ func main() {
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			handler.Load().(http.Handler).ServeHTTP(w, r)
 		}),
-		ReadTimeout:  readTimeout,
-		WriteTimeout: writeTimeout,
-		IdleTimeout:  idleTimeout,
+		ReadTimeout:    readTimeout,
+		WriteTimeout:   writeTimeout,
+		IdleTimeout:    idleTimeout,
+		MaxHeaderBytes: 1 << 20,
 	}
 
 	log.Printf("callback-guard listening on %s", cfg.Listen)

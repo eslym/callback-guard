@@ -205,6 +205,24 @@ Priority rules:
   a
   blacklisted CIDR, the request is denied immediately regardless of whitelist entries.
 
+## Security opt-ins (compatibility-first)
+
+The default behavior remains compatibility-first. You can opt into stricter behavior via `security` in config:
+
+```yaml
+security:
+  disable_http2: false
+  strict_request_validation: false
+  block_metadata_endpoints: false
+```
+
+- `disable_http2`: disables HTTP/2 for upstream requests made by the proxy transport.
+- `strict_request_validation`: rejects malformed proxy requests early (invalid CONNECT target, missing host/scheme).
+- `block_metadata_endpoints`: blocks common cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`,
+  `fd00:ec2::254`) even if they would otherwise be allowed.
+
+Note: host whitelist matches now connect using already-resolved IP addresses to reduce DNS rebinding risk.
+
 ## When to use it
 
 - You accept external callbacks or webhooks that include user-provided URLs and you need to fetch or validate those URLs

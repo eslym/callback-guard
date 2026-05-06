@@ -214,14 +214,36 @@ security:
   disable_http2: false
   strict_request_validation: false
   block_metadata_endpoints: false
+  allowed_ports: []
+  auth_rate_limit: false
+  auth_max_failures: 10
+  auth_window: "1m"
+  auth_block_duration: "5m"
 ```
 
 - `disable_http2`: disables HTTP/2 for upstream requests made by the proxy transport.
 - `strict_request_validation`: rejects malformed proxy requests early (invalid CONNECT target, missing host/scheme).
 - `block_metadata_endpoints`: blocks common cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`,
   `fd00:ec2::254`) even if they would otherwise be allowed.
+- `allowed_ports`: optional destination port allowlist. When set, requests to other ports are denied.
+- `auth_rate_limit`: enables per-client+username authentication failure throttling.
+- `auth_max_failures`, `auth_window`, `auth_block_duration`: tune auth throttling behavior.
 
 Note: host whitelist matches now connect using already-resolved IP addresses to reduce DNS rebinding risk.
+
+Example stricter profile (opt-in):
+
+```yaml
+security:
+  disable_http2: true
+  strict_request_validation: true
+  block_metadata_endpoints: true
+  allowed_ports: [80, 443]
+  auth_rate_limit: true
+  auth_max_failures: 8
+  auth_window: "1m"
+  auth_block_duration: "10m"
+```
 
 ## When to use it
 

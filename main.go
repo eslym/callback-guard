@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -57,9 +58,14 @@ type Config struct {
 }
 
 type SecurityConfig struct {
-	DisableHTTP2            bool `yaml:"disable_http2"`
-	StrictRequestValidation bool `yaml:"strict_request_validation"`
-	BlockMetadataEndpoints  bool `yaml:"block_metadata_endpoints"`
+	DisableHTTP2            bool   `yaml:"disable_http2"`
+	StrictRequestValidation bool   `yaml:"strict_request_validation"`
+	BlockMetadataEndpoints  bool   `yaml:"block_metadata_endpoints"`
+	AllowedPorts            []int  `yaml:"allowed_ports"`
+	AuthRateLimit           bool   `yaml:"auth_rate_limit"`
+	AuthMaxFailures         int    `yaml:"auth_max_failures"`
+	AuthWindow              string `yaml:"auth_window"`
+	AuthBlockDuration       string `yaml:"auth_block_duration"`
 }
 
 // -------------------------
@@ -309,6 +315,7 @@ type SafeDialer struct {
 	ipBlacklist   []*net.IPNet
 	hostBlacklist []string
 	security      SecurityConfig
+	allowedPorts  map[string]struct{}
 	// per-user overrides
 	userOverrides map[string]*UserOverrides
 }
@@ -322,6 +329,11 @@ func (sd *SafeDialer) DialContext(ctx context.Context, network, address string) 
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, fmt.Errorf("invalid address %q: %w", address, err)
+	}
+	if len(sd.allowedPorts) > 0 {
+		if _, ok := sd.allowedPorts[port]; !ok {
+			return nil, fmt.Errorf("destination port %s is not allowed", port)
+		}
 	}
 
 	// Try to obtain authenticated username from context
@@ -451,6 +463,80 @@ type ProxyServer struct {
 	handleRedirect bool
 	verbose        bool
 	security       SecurityConfig
+	authLimiter    *authLimiter
+}
+
+type authAttempt struct {
+	failures     []time.Time
+	blockedUntil time.Time
+}
+
+type authLimiter struct {
+	mu            sync.Mutex
+	entries       map[string]*authAttempt
+	window        time.Duration
+	maxFailures   int
+	blockDuration time.Duration
+}
+
+func newAuthLimiter(window time.Duration, maxFailures int, blockDuration time.Duration) *authLimiter {
+	if maxFailures <= 0 {
+		maxFailures = 10
+	}
+	if window <= 0 {
+		window = 1 * time.Minute
+	}
+	if blockDuration <= 0 {
+		blockDuration = 5 * time.Minute
+	}
+	return &authLimiter{
+		entries:       make(map[string]*authAttempt),
+		window:        window,
+		maxFailures:   maxFailures,
+		blockDuration: blockDuration,
+	}
+}
+
+func (al *authLimiter) isBlocked(key string, now time.Time) bool {
+	al.mu.Lock()
+	defer al.mu.Unlock()
+	a := al.entries[key]
+	if a == nil {
+		return false
+	}
+	if now.Before(a.blockedUntil) {
+		return true
+	}
+	return false
+}
+
+func (al *authLimiter) recordFailure(key string, now time.Time) {
+	al.mu.Lock()
+	defer al.mu.Unlock()
+	a := al.entries[key]
+	if a == nil {
+		a = &authAttempt{}
+		al.entries[key] = a
+	}
+	cutoff := now.Add(-al.window)
+	kept := a.failures[:0]
+	for _, ts := range a.failures {
+		if ts.After(cutoff) {
+			kept = append(kept, ts)
+		}
+	}
+	a.failures = kept
+	a.failures = append(a.failures, now)
+	if len(a.failures) >= al.maxFailures {
+		a.blockedUntil = now.Add(al.blockDuration)
+		a.failures = nil
+	}
+}
+
+func (al *authLimiter) recordSuccess(key string) {
+	al.mu.Lock()
+	defer al.mu.Unlock()
+	delete(al.entries, key)
 }
 
 func newProxyServer(
@@ -464,6 +550,14 @@ func newProxyServer(
 	verbose bool,
 	security SecurityConfig,
 ) *ProxyServer {
+	allowedPorts := make(map[string]struct{}, len(security.AllowedPorts))
+	for _, p := range security.AllowedPorts {
+		if p <= 0 || p > 65535 {
+			continue
+		}
+		allowedPorts[strconv.Itoa(p)] = struct{}{}
+	}
+
 	sd := &SafeDialer{
 		inner: net.Dialer{
 			Timeout:   30 * time.Second,
@@ -474,6 +568,7 @@ func newProxyServer(
 		ipBlacklist:   ipBlacklist,
 		hostBlacklist: hostBlacklist,
 		security:      security,
+		allowedPorts:  allowedPorts,
 		userOverrides: userOverrides,
 	}
 
@@ -496,6 +591,13 @@ func newProxyServer(
 		users = auth.Users
 	}
 
+	var limiter *authLimiter
+	if security.AuthRateLimit {
+		window := parseDurationOrDefault(security.AuthWindow, 1*time.Minute, "security.auth_window")
+		blockDuration := parseDurationOrDefault(security.AuthBlockDuration, 5*time.Minute, "security.auth_block_duration")
+		limiter = newAuthLimiter(window, security.AuthMaxFailures, blockDuration)
+	}
+
 	return &ProxyServer{
 		transport:      tr,
 		dialer:         sd,
@@ -504,6 +606,7 @@ func newProxyServer(
 		handleRedirect: handleRedirect,
 		verbose:        verbose,
 		security:       security,
+		authLimiter:    limiter,
 	}
 }
 
@@ -595,8 +698,20 @@ func (p *ProxyServer) checkAuth(w http.ResponseWriter, r *http.Request) (bool, s
 		return true, ""
 	}
 
+	if p.authLimiter != nil {
+		key := p.authLimitKey(r)
+		if p.authLimiter.isBlocked(key, time.Now()) {
+			w.Header().Set("Proxy-Authenticate", `Basic realm="proxy"`)
+			http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
+			return false, ""
+		}
+	}
+
 	h := r.Header.Get("Proxy-Authorization")
 	if h == "" {
+		if p.authLimiter != nil {
+			p.authLimiter.recordFailure(p.authLimitKeyWithUser(r, ""), time.Now())
+		}
 		w.Header().Set("Proxy-Authenticate", `Basic realm="proxy"`)
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
 		return false, ""
@@ -604,6 +719,9 @@ func (p *ProxyServer) checkAuth(w http.ResponseWriter, r *http.Request) (bool, s
 
 	const prefix = "Basic "
 	if !strings.HasPrefix(h, prefix) {
+		if p.authLimiter != nil {
+			p.authLimiter.recordFailure(p.authLimitKeyWithUser(r, ""), time.Now())
+		}
 		w.Header().Set("Proxy-Authenticate", `Basic realm="proxy"`)
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
 		return false, ""
@@ -611,6 +729,9 @@ func (p *ProxyServer) checkAuth(w http.ResponseWriter, r *http.Request) (bool, s
 
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(h[len(prefix):]))
 	if err != nil {
+		if p.authLimiter != nil {
+			p.authLimiter.recordFailure(p.authLimitKeyWithUser(r, ""), time.Now())
+		}
 		w.Header().Set("Proxy-Authenticate", `Basic realm="proxy"`)
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
 		return false, ""
@@ -618,6 +739,9 @@ func (p *ProxyServer) checkAuth(w http.ResponseWriter, r *http.Request) (bool, s
 
 	parts := strings.SplitN(string(raw), ":", 2)
 	if len(parts) != 2 {
+		if p.authLimiter != nil {
+			p.authLimiter.recordFailure(p.authLimitKeyWithUser(r, ""), time.Now())
+		}
 		w.Header().Set("Proxy-Authenticate", `Basic realm="proxy"`)
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
 		return false, ""
@@ -626,14 +750,48 @@ func (p *ProxyServer) checkAuth(w http.ResponseWriter, r *http.Request) (bool, s
 
 	hash, ok := p.authUsers[user]
 	if !ok || bcrypt.CompareHashAndPassword(hash, []byte(pass)) != nil {
+		if p.authLimiter != nil {
+			p.authLimiter.recordFailure(p.authLimitKeyWithUser(r, user), time.Now())
+		}
 		w.Header().Set("Proxy-Authenticate", `Basic realm="proxy"`)
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
 		return false, ""
+	}
+	if p.authLimiter != nil {
+		p.authLimiter.recordSuccess(p.authLimitKeyWithUser(r, user))
 	}
 
 	// Don't forward internal auth header upstream.
 	r.Header.Del("Proxy-Authorization")
 	return true, user
+}
+
+func (p *ProxyServer) authLimitKey(r *http.Request) string {
+	return p.authLimitKeyWithUser(r, extractBasicUsername(r.Header.Get("Proxy-Authorization")))
+}
+
+func (p *ProxyServer) authLimitKeyWithUser(r *http.Request, user string) string {
+	ip := requestFrom(r)
+	if user == "" {
+		user = "-"
+	}
+	return ip + "|" + user
+}
+
+func extractBasicUsername(h string) string {
+	const prefix = "Basic "
+	if !strings.HasPrefix(h, prefix) {
+		return ""
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(h[len(prefix):]))
+	if err != nil {
+		return ""
+	}
+	parts := strings.SplitN(string(raw), ":", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	return parts[0]
 }
 
 // Handle HTTP (non-CONNECT)
@@ -1112,6 +1270,21 @@ func main() {
 	}
 	if len(hostBlacklist) > 0 {
 		log.Printf("Host blacklist patterns: %v", hostBlacklist)
+	}
+	if cfg.Security.DisableHTTP2 {
+		log.Printf("security.disable_http2=true")
+	}
+	if cfg.Security.StrictRequestValidation {
+		log.Printf("security.strict_request_validation=true")
+	}
+	if cfg.Security.BlockMetadataEndpoints {
+		log.Printf("security.block_metadata_endpoints=true")
+	}
+	if len(cfg.Security.AllowedPorts) > 0 {
+		log.Printf("security.allowed_ports=%v", cfg.Security.AllowedPorts)
+	}
+	if cfg.Security.AuthRateLimit {
+		log.Printf("security.auth_rate_limit=true")
 	}
 
 	if *watch {
